@@ -100,6 +100,7 @@ npm run test:e2e
 - Worker 禁止拼接 Shell 命令，统一使用参数数组调用 `ffprobe/ffmpeg`。
 - 所有资源查询都带 `userId` 条件，无法通过 ID 访问其他用户资源。
 - 删除练习进入后台清理队列，失败时保留 `DELETE_FAILED` 以便重试和审计。
+- Worker 启动和运行中会定期扫描卡在 `UPLOADED`/`PROCESSING` 的音频并幂等重新入队（`MEDIA_STUCK_AFTER_MS`、`MEDIA_RECOVERY_INTERVAL_MS`），进程异常退出后记录不会一直停在处理中；所有状态迁移都带前置条件，恢复流程不会覆盖已完成的元数据。
 
 ## 项目文档
 

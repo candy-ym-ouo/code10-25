@@ -12,6 +12,10 @@ const envSchema = z.object({
   S3_FORCE_PATH_STYLE: z.string().optional().transform((value) => value == null || value.toLowerCase() === "true"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(3),
+  /** updatedAt 早于该时长的 UPLOADED/PROCESSING 记录视为卡住，由恢复扫描重新入队 */
+  MEDIA_STUCK_AFTER_MS: z.coerce.number().int().min(60_000).default(10 * 60_000),
+  /** 卡住记录恢复扫描的执行间隔 */
+  MEDIA_RECOVERY_INTERVAL_MS: z.coerce.number().int().min(10_000).default(60_000),
 });
 
 let cached: z.infer<typeof envSchema> | undefined;

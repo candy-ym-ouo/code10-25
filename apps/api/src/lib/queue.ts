@@ -11,12 +11,29 @@ export function getMediaQueue(): Queue {
   return queue;
 }
 
+/**
+ * 探测任务使用确定性 job id，与 Worker 的卡住记录恢复扫描共用同一个键：
+ * 同一份音频在队列里最多只有一个未完结任务，重复确认上传/重试/恢复扫描
+ * 不会产生重复任务；同名任务已完结（成功/失败）时先移除再重新入队。
+ */
 export async function enqueueProbe(mediaId: string): Promise<void> {
-  await getMediaQueue().add(
+  const mediaQueue = getMediaQueue();
+  const jobId = `probe:${mediaId}`;
+  const existing = await mediaQueue.getJob(jobId);
+  if (existing) {
+    const state = await existing.getState();
+    if (state !== "completed" && state !== "failed") return;
+    try {
+      await existing.remove();
+    } catch {
+      // 并发的入队方可能已将其移除，继续入队即可，jobId 会兜底去重
+    }
+  }
+  await mediaQueue.add(
     "probe-media",
     { mediaId },
     {
-      jobId: `probe:${mediaId}:${Date.now()}`,
+      jobId,
       attempts: 3,
       backoff: { type: "exponential", delay: 3000 },
       removeOnComplete: 100,

@@ -1,15 +1,11 @@
-import { createWriteStream } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { pipeline } from "node:stream/promises";
-import { Worker } from "bullmq";
+import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { getConfig } from "./config/env.js";
 import { prisma } from "./lib/prisma.js";
-import { deleteObject, getObjectStream, putObject } from "./lib/s3.js";
-import { generatePeaks, probeAudio } from "./lib/media.js";
+import { deleteObject, putObject } from "./lib/s3.js";
 import { buildUserExport } from "./lib/export.js";
+import { processMedia } from "./lib/processing.js";
+import { recoverStuckMedia } from "./lib/recovery.js";
 
 const config = getConfig();
 const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
@@ -20,60 +16,7 @@ const log = (level: "info" | "error" | "warn", data: Record<string, unknown>, me
   else console.log(output);
 };
 
-async function processMedia(mediaId: string) {
-  const media = await prisma.mediaAsset.findUnique({ where: { id: mediaId } });
-  if (!media) return;
-  await prisma.mediaAsset.update({
-    where: { id: mediaId },
-    data: { status: "PROCESSING", failureCode: null, failureMessage: null },
-  });
-
-  const workDir = await mkdtemp(path.join(tmpdir(), "practice-media-"));
-  const extension = path.extname(media.originalName).slice(0, 12);
-  const localPath = path.join(workDir, `audio${extension}`);
-  try {
-    const stream = await getObjectStream(media.objectKey);
-    await pipeline(stream, createWriteStream(localPath));
-    const [probe, peaks] = await Promise.all([probeAudio(localPath), generatePeaks(localPath)]);
-    await prisma.$transaction(async (tx) => {
-      await tx.mediaAsset.update({
-        where: { id: mediaId },
-        data: {
-          status: "READY",
-          durationMs: probe.durationMs,
-          codec: probe.codec,
-          sampleRate: probe.sampleRate,
-          channels: probe.channels,
-          peaks,
-          processedAt: new Date(),
-          expiresAt: null,
-          failureCode: null,
-          failureMessage: null,
-        },
-      });
-      await tx.practiceSession.updateMany({
-        where: { id: media.sessionId, userId: media.userId, status: "DRAFT" },
-        data: { status: "IN_REVIEW", version: { increment: 1 } },
-      });
-    });
-    log("info", { mediaId, durationMs: Number(probe.durationMs) }, "media probe completed");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "UNKNOWN_MEDIA_ERROR";
-    const code = message === "NO_AUDIO_STREAM" ? "NO_AUDIO_STREAM" : message === "INVALID_DURATION" ? "INVALID_DURATION" : "MEDIA_PROBE_FAILED";
-    await prisma.mediaAsset.update({
-      where: { id: mediaId },
-      data: {
-        status: "FAILED",
-        failureCode: code,
-        failureMessage: message === "NO_AUDIO_STREAM" ? "文件中没有可用的音轨" : "音频无法解析，请替换文件后重试",
-        processedAt: new Date(),
-      },
-    });
-    log("error", { mediaId, err: message }, "media probe failed");
-  } finally {
-    await rm(workDir, { recursive: true, force: true });
-  }
-}
+const runProcessMedia = (mediaId: string) => processMedia({ prisma, log }, mediaId);
 
 async function cleanupSession(sessionId: string) {
   const session = await prisma.practiceSession.findUnique({
@@ -128,7 +71,7 @@ async function scanOverdueGoals() {
 const worker = new Worker(
   "media-processing",
   async (job) => {
-    if (job.name === "probe-media") return processMedia(String(job.data.mediaId));
+    if (job.name === "probe-media") return runProcessMedia(String(job.data.mediaId));
     if (job.name === "cleanup-session") return cleanupSession(String(job.data.sessionId));
     if (job.name === "export-data") return exportData(String(job.data.exportId));
     throw new Error(`Unknown job: ${job.name}`);
@@ -139,11 +82,27 @@ const worker = new Worker(
 worker.on("failed", (job, error) => log("error", { jobId: job?.id, jobName: job?.name, err: error.message }, "job failed"));
 worker.on("error", (error) => log("error", { err: error.message }, "worker error"));
 
+// 恢复扫描：进程异常退出或队列丢失后，数据库里可能残留卡在 UPLOADED/PROCESSING
+// 的记录。数据库是业务数据源，定期扫描并幂等重新入队即可自愈。
+const recoveryQueue = new Queue("media-processing", { connection: redis.duplicate() });
+async function recoverStuckMediaOnce() {
+  try {
+    const result = await recoverStuckMedia({ prisma, queue: recoveryQueue, stuckAfterMs: config.MEDIA_STUCK_AFTER_MS });
+    if (result.enqueued > 0) log("info", { ...result }, "stuck media re-enqueued");
+  } catch (error) {
+    log("error", { err: error instanceof Error ? error.message : String(error) }, "stuck media recovery failed");
+  }
+}
+
 const heartbeat = setInterval(async () => {
   await redis.set("worker:heartbeat", new Date().toISOString(), "EX", 30);
 }, 10_000);
 await redis.set("worker:heartbeat", new Date().toISOString(), "EX", 30);
 await scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
+await recoverStuckMediaOnce();
+const recoveryInterval = setInterval(() => {
+  void recoverStuckMediaOnce();
+}, config.MEDIA_RECOVERY_INTERVAL_MS);
 const overdueInterval = setInterval(() => {
   void scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
 }, 24 * 60 * 60_000);
@@ -151,8 +110,10 @@ const overdueInterval = setInterval(() => {
 async function shutdown(signal: string) {
   log("info", { signal }, "shutting down worker");
   clearInterval(heartbeat);
+  clearInterval(recoveryInterval);
   clearInterval(overdueInterval);
   await worker.close();
+  await recoveryQueue.close();
   await redis.quit();
   await prisma.$disconnect();
   process.exit(0);
