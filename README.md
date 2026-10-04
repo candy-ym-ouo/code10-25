@@ -100,6 +100,7 @@ npm run test:e2e
 - Worker 禁止拼接 Shell 命令，统一使用参数数组调用 `ffprobe/ffmpeg`。
 - 所有资源查询都带 `userId` 条件，无法通过 ID 访问其他用户资源。
 - 删除练习进入后台清理队列，失败时保留 `DELETE_FAILED` 以便重试和审计。
+- Worker 启动后周期性扫描异常退出残留的 `PROCESSING` 音频，通过条件更新安全地重新排队，不会覆盖已完成的解析元数据。
 
 ## 项目文档
 
